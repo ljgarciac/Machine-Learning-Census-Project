@@ -6,6 +6,7 @@ Submódulos principales:
     - models:        entrenamiento de los 4 modelos (LogReg, RF, XGB, LGBM).
     - evaluation:    métricas, gráficos y tabla comparativa.
     - ensemble:      Soft Voting y Weighted Average ponderado por AUC-PR.
+    - inference:     aplicación del preprocesamiento aprendido a casos nuevos.
 """
 
 __version__ = "0.1.0"
