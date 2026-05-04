@@ -45,8 +45,9 @@ USER_FACING_FIELDS: list[str] = [
     "ACLSWKR",   # clase de trabajador
     "WKSWORK",   # semanas trabajadas en el año
     "CAPGAIN",   # ganancias de capital
-    "CAPLOSS",   # pérdidas de capital
+    "GAPLOSS",   # pérdidas de capital (sí, así está en el dataset original)
     "DIVVAL",    # dividendos
+    "AHRSPAY",   # salario por hora
 ]
 
 FIELD_LABELS: dict[str, str] = {
@@ -60,19 +61,66 @@ FIELD_LABELS: dict[str, str] = {
     "ACLSWKR": "Clase de trabajador",
     "WKSWORK": "Semanas trabajadas (año)",
     "CAPGAIN": "Ganancias de capital (USD)",
-    "CAPLOSS": "Pérdidas de capital (USD)",
+    "GAPLOSS": "Pérdidas de capital (USD)",
     "DIVVAL":  "Dividendos recibidos (USD)",
+    "AHRSPAY": "Salario por hora (USD)",
 }
 
 
 # ---------------------------------------------------------------------------
-# Carga única (cacheada) del pipeline completo
+# Cargas separadas (lazy) — solo se ejecutan cuando se llaman
 # ---------------------------------------------------------------------------
 
-@st.cache_resource(show_spinner="Cargando dataset y reproduciendo el preprocesamiento...")
-def load_pipeline():
+@st.cache_resource(show_spinner="Descargando dataset desde UCI...")
+def load_dataset():
+    """Carga rápida: dataset + split + defaults/options para el formulario.
+
+    No preprocesa ni carga modelos. Es lo único que necesita el formulario
+    de la pestaña 3 al renderizarse por primera vez.
+    """
     X, y = load_census_data()
     X_train, X_test, y_train, y_test = split_train_test(X, y)
+
+    defaults: dict[str, object] = {}
+    for col in X_train.columns:
+        if X_train[col].dtype == "object":
+            mode_val = X_train[col].mode()
+            defaults[col] = mode_val.iloc[0] if len(mode_val) else ""
+        else:
+            med = X_train[col].median()
+            defaults[col] = float(med) if pd.notna(med) else 0.0
+
+    cat_options: dict[str, list[str]] = {}
+    for col in X_train.select_dtypes(include="object").columns:
+        vals = sorted(v for v in X_train[col].dropna().unique() if isinstance(v, str))
+        cat_options[col] = vals
+
+    num_ranges: dict[str, tuple[float, float]] = {}
+    for col in X_train.select_dtypes(exclude="object").columns:
+        num_ranges[col] = (float(X_train[col].min()), float(X_train[col].max()))
+
+    return {
+        "X_train":     X_train,
+        "X_test":      X_test,
+        "y_train":     y_train,
+        "y_test":      y_test,
+        "defaults":    defaults,
+        "cat_options": cat_options,
+        "num_ranges":  num_ranges,
+    }
+
+
+@st.cache_resource(show_spinner="Preprocesando + cargando modelos (puede tardar ~1 min)...")
+def load_predictor():
+    """Carga pesada: artifacts del preprocesamiento + 4 modelos + pesos del ensamble.
+
+    Reusa el dataset cacheado por `load_dataset()`. Se ejecuta solo cuando se
+    necesita predecir o mostrar métricas.
+    """
+    data = load_dataset()
+    X_train, X_test, y_train, y_test = (
+        data["X_train"], data["X_test"], data["y_train"], data["y_test"]
+    )
     _, _, X_test_proc, artifacts = preprocess_full(X_train, X_test, y_train)
 
     models = {}
@@ -91,38 +139,14 @@ def load_pipeline():
     individual = comparison_table(predictions, y_test.values)
     _, _, weights = weighted_average_by_aucpr(predictions, individual["AUC-PR"])
 
-    # Defaults por columna a partir de X_train
-    defaults: dict[str, object] = {}
-    for col in X_train.columns:
-        if X_train[col].dtype == "object":
-            mode_val = X_train[col].mode()
-            defaults[col] = mode_val.iloc[0] if len(mode_val) else ""
-        else:
-            defaults[col] = float(X_train[col].median())
-
-    # Categorías observadas (para los selectbox)
-    cat_options: dict[str, list[str]] = {}
-    for col in X_train.select_dtypes(include="object").columns:
-        vals = sorted(v for v in X_train[col].dropna().unique() if isinstance(v, str))
-        cat_options[col] = vals
-
-    # Rangos numéricos (para los number_input)
-    num_ranges: dict[str, tuple[float, float]] = {}
-    for col in X_train.select_dtypes(exclude="object").columns:
-        num_ranges[col] = (float(X_train[col].min()), float(X_train[col].max()))
-
     return {
-        "X_train": X_train,
-        "y_test": y_test,
-        "X_test_proc": X_test_proc,
-        "artifacts": artifacts,
-        "models": models,
+        "artifacts":   artifacts,
+        "models":      models,
         "predictions": predictions,
-        "individual": individual,
-        "weights": weights,
-        "defaults": defaults,
-        "cat_options": cat_options,
-        "num_ranges": num_ranges,
+        "individual":  individual,
+        "weights":     weights,
+        "X_test_proc": X_test_proc,
+        "y_test":      y_test,
     }
 
 
@@ -189,7 +213,7 @@ la métrica más relevante para el problema.
 # Tab 2 — Desempeño
 # ---------------------------------------------------------------------------
 
-def render_performance_tab(pipeline: dict) -> None:
+def render_performance_tab() -> None:
     from sklearn.metrics import (
         average_precision_score,
         precision_recall_curve,
@@ -199,10 +223,18 @@ def render_performance_tab(pipeline: dict) -> None:
 
     st.header("Desempeño de los modelos")
 
-    individual = pipeline["individual"]
-    predictions = pipeline["predictions"]
-    weights = pipeline["weights"]
-    y_test = pipeline["y_test"]
+    predictor = load_predictor()
+    individual = predictor["individual"]
+    predictions = predictor["predictions"]
+    weights = predictor["weights"]
+    y_test = predictor["y_test"]
+
+    if not predictions:
+        st.error(
+            "No se encontraron modelos serializados en `models/`. Corre primero "
+            "`uv run python scripts/train_all.py`."
+        )
+        return
 
     # Tabla con ensambles incluidos
     from census_ml.ensemble import soft_voting
@@ -302,22 +334,28 @@ def render_performance_tab(pipeline: dict) -> None:
 # Tab 3 — POC de predicción interactiva
 # ---------------------------------------------------------------------------
 
-def render_prediction_tab(pipeline: dict) -> None:
+def render_prediction_tab() -> None:
     st.header("POC — Predicción de un caso")
     st.markdown(
-        "Ajusta los valores del individuo. Los campos no mostrados se rellenan "
-        "automáticamente con la moda (categóricas) o la mediana (numéricas) de "
-        "los datos de entrenamiento."
+        "Ajusta los valores del individuo y presiona **Predecir** para correr el "
+        "ensamble. Los campos no mostrados se rellenan automáticamente con la moda "
+        "(categóricas) o la mediana (numéricas) de los datos de entrenamiento."
     )
 
-    defaults = pipeline["defaults"]
-    cat_options = pipeline["cat_options"]
-    num_ranges = pipeline["num_ranges"]
+    data = load_dataset()
+    defaults = data["defaults"]
+    cat_options = data["cat_options"]
+    num_ranges = data["num_ranges"]
+    train_columns = data["X_train"].columns
+
+    available_fields = [f for f in USER_FACING_FIELDS if f in train_columns]
+    missing = set(USER_FACING_FIELDS) - set(available_fields)
+    if missing:
+        st.warning(f"Campos no disponibles en el dataset (omitidos): {sorted(missing)}")
 
     inputs: dict[str, object] = {}
-
     cols = st.columns(3)
-    for i, field in enumerate(USER_FACING_FIELDS):
+    for i, field in enumerate(available_fields):
         col = cols[i % 3]
         label = FIELD_LABELS.get(field, field)
         default = defaults.get(field)
@@ -329,49 +367,64 @@ def render_prediction_tab(pipeline: dict) -> None:
                 inputs[field] = st.selectbox(label, options, index=idx, key=f"in_{field}")
             else:
                 lo, hi = num_ranges.get(field, (0.0, 1e6))
+                safe_default = float(default) if default is not None else 0.0
                 inputs[field] = st.number_input(
                     label,
                     min_value=float(lo),
                     max_value=float(hi),
-                    value=float(default),
+                    value=safe_default,
                     step=1.0,
                     key=f"in_{field}",
                 )
 
-    with st.expander("Mostrar valores completos del registro (incluye campos rellenados automáticamente)"):
+    with st.expander("Mostrar valores completos del registro (incluye los rellenados automáticamente)"):
         full_record = {**defaults, **inputs}
         st.json(full_record, expanded=False)
 
-    if st.button("Predecir", type="primary", use_container_width=True):
-        full_record = {**defaults, **inputs}
-        X_new = pd.DataFrame([full_record], columns=pipeline["X_train"].columns)
-        X_proc = apply_preprocessing(X_new, pipeline["artifacts"])
+    st.markdown("---")
+    predict_clicked = st.button("Predecir", type="primary", use_container_width=True)
 
-        probs = predict_with_ensemble(X_proc, pipeline["models"], pipeline["weights"])
+    if not predict_clicked:
+        st.info(
+            "El preprocesamiento y la carga de los 4 modelos se ejecutan solo al "
+            "presionar **Predecir** (puede tardar ~1 minuto la primera vez)."
+        )
+        return
 
-        st.markdown("---")
-        st.subheader("Probabilidades de la clase positiva (>50K)")
+    predictor = load_predictor()
+    if not predictor["models"]:
+        st.error(
+            "No se encontraron modelos serializados en `models/`. Corre primero "
+            "`uv run python scripts/train_all.py`."
+        )
+        return
 
-        rows = [{"Modelo": name, "P(>50K)": float(prob[0])} for name, prob in probs.items()]
-        df_probs = pd.DataFrame(rows)
+    full_record = {**defaults, **inputs}
+    X_new = pd.DataFrame([full_record], columns=train_columns)
+    X_proc = apply_preprocessing(X_new, predictor["artifacts"])
+    probs = predict_with_ensemble(X_proc, predictor["models"], predictor["weights"])
 
-        col_chart, col_table = st.columns([3, 2])
-        with col_chart:
-            fig = px.bar(df_probs, x="Modelo", y="P(>50K)", color="Modelo",
-                         text="P(>50K)", template="plotly_white", height=420)
-            fig.update_traces(texttemplate="%{text:.3f}", textposition="outside")
-            fig.update_layout(yaxis_range=[0, 1], showlegend=False)
-            st.plotly_chart(fig, use_container_width=True)
-        with col_table:
-            st.dataframe(
-                df_probs.set_index("Modelo").style.format("{:.4f}"),
-                use_container_width=True,
-            )
+    st.subheader("Probabilidades de la clase positiva (>50K)")
+    rows = [{"Modelo": name, "P(>50K)": float(prob[0])} for name, prob in probs.items()]
+    df_probs = pd.DataFrame(rows)
 
-        ensemble_p = float(probs["Ensemble"][0])
-        prediction_label = ">50K" if ensemble_p >= 0.5 else "<=50K"
-        st.markdown(f"### Predicción del ensamble: **{prediction_label}**")
-        st.progress(ensemble_p, text=f"P(>50K) = {ensemble_p:.4f}  ({prediction_label})")
+    col_chart, col_table = st.columns([3, 2])
+    with col_chart:
+        fig = px.bar(df_probs, x="Modelo", y="P(>50K)", color="Modelo",
+                     text="P(>50K)", template="plotly_white", height=420)
+        fig.update_traces(texttemplate="%{text:.3f}", textposition="outside")
+        fig.update_layout(yaxis_range=[0, 1], showlegend=False)
+        st.plotly_chart(fig, use_container_width=True)
+    with col_table:
+        st.dataframe(
+            df_probs.set_index("Modelo").style.format("{:.4f}"),
+            use_container_width=True,
+        )
+
+    ensemble_p = float(probs["Ensemble"][0])
+    prediction_label = ">50K" if ensemble_p >= 0.5 else "<=50K"
+    st.markdown(f"### Predicción del ensamble: **{prediction_label}**")
+    st.progress(ensemble_p, text=f"P(>50K) = {ensemble_p:.4f}  ({prediction_label})")
 
 
 # ---------------------------------------------------------------------------
@@ -390,15 +443,6 @@ def main() -> None:
         "XGBoost y LightGBM."
     )
 
-    pipeline = load_pipeline()
-
-    if not pipeline["models"]:
-        st.error(
-            "No se encontraron modelos serializados en `models/`. Corre primero "
-            "`uv run python scripts/train_all.py`."
-        )
-        return
-
     tab1, tab2, tab3 = st.tabs([
         "1. Resumen",
         "2. Desempeño",
@@ -407,9 +451,9 @@ def main() -> None:
     with tab1:
         render_summary_tab()
     with tab2:
-        render_performance_tab(pipeline)
+        render_performance_tab()
     with tab3:
-        render_prediction_tab(pipeline)
+        render_prediction_tab()
 
 
 if __name__ == "__main__":
