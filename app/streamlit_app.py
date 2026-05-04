@@ -205,6 +205,18 @@ la métrica más relevante para el problema.
 
 > Para la justificación detallada de cada decisión técnica, consulta
 > `INFORME_PROYECTO.md` en la raíz del repositorio.
+
+---
+
+### Autores
+
+Proyecto académico — **Maestría en Inteligencia Artificial, Aprendizaje de Máquina**.
+
+- Luis Jorge García Camargo
+- Luis Eduardo Uribe
+- Antonia Gacharna
+- Felipe Barreto
+- Victor Cantor
         """
     )
 
@@ -442,6 +454,19 @@ def main() -> None:
         "Ensamble ponderado por AUC-PR sobre Logistic Regression, Random Forest, "
         "XGBoost y LightGBM."
     )
+
+    with st.sidebar:
+        st.markdown("### Autores")
+        st.markdown(
+            "- Luis Jorge García Camargo\n"
+            "- Luis Eduardo Uribe\n"
+            "- Antonia Gacharna\n"
+            "- Felipe Barreto\n"
+            "- Victor Cantor"
+        )
+        st.caption(
+            "Maestría en Inteligencia Artificial — Aprendizaje de Máquina"
+        )
 
     tab1, tab2, tab3 = st.tabs([
         "1. Resumen",
